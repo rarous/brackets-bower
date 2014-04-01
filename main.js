@@ -31,20 +31,20 @@ define(function (require, exports, module) {
 
     var AppInit        = brackets.getModule("utils/AppInit"),
         ExtensionUtils = brackets.getModule("utils/ExtensionUtils"),
-        NodeConnection = brackets.getModule("utils/NodeConnection"),
+        NodeDomain     = brackets.getModule("utils/NodeDomain"),
         CommandManager = brackets.getModule("command/CommandManager"),
         KeyBindingManager = brackets.getModule("command/KeyBindingManager"),
         Menus          = brackets.getModule("command/Menus"),
         QuickOpen      = brackets.getModule("search/QuickOpen"),
         ProjectManager = brackets.getModule("project/ProjectManager"),
         StatusBar      = brackets.getModule("widgets/StatusBar"),
-        FileSystem     = brackets.getModule("filesystem/FileSystem");
+        FileSystem     = brackets.getModule("filesystem/FileSystem"),
+        _              = brackets.getModule("thirdparty/lodash");
     
     var CMD_INSTALL_FROM_BOWER = "com.adobe.brackets.commands.bower.installFromBower",
         STATUS_BOWER = "status-bower";
 
-    var nodeConnection,
-        nodePromise = new $.Deferred(),
+    var bowerDomain = new NodeDomain("bower", ExtensionUtils.getModulePath(module, "node/BowerDomain")),
         packageListPromise,
         modalBar,
         queue = [],
@@ -90,29 +90,38 @@ define(function (require, exports, module) {
         // BowerDomain?)
         var pkgName = queue.shift();
         _showStatus("Installing " + pkgName + "...", true);
-        installPromise = nodeConnection.domains.bower.installPackage(
+        
+        // Watch for when the folder is created so we can reveal it in the file tree.
+        var pkgPath = ProjectManager.getProjectRoot().fullPath + "bower_components/" + pkgName + "/",
+            pkgDir = FileSystem.getDirectoryForPath(pkgPath);
+        FileSystem.on("change.bower", function (event, entry, added, removed) {
+            if (!entry || (entry.isDirectory &&
+                            entry.name === "bower_components" &&
+                            (added === null || _.find(added, function (addedEntry) { return addedEntry.name === pkgName; })))) {
+                pkgDir.exists(function (err, exists) {
+                    if (exists) {
+                        $(FileSystem).off(".bower");
+                        // This is a little bogus. We don't actually know when the project tree will be refreshed with the new
+                        // file, so we do this on a timeout. Ideally we'd have an event for that, or a way to ensure this is
+                        // visible after the next refresh.
+                        window.setTimeout(function () {
+                            ProjectManager.showInTree(pkgDir);
+                        }, 100);
+                    }
+                });
+            }
+        });
+        
+        installPromise = bowerDomain.exec(
+            "installPackage",
             ProjectManager.getProjectRoot().fullPath,
             pkgName
-        ).done(function (error) {
+        ).done(function () {
             _showStatus("Installed " + pkgName, false);
-            
-            var rootPath = ProjectManager.getProjectRoot().fullPath,
-                rootDir = FileSystem.getDirectoryForPath(rootPath),
-                bowerPath = rootPath + "bower_components/",
-                bowerDir = FileSystem.getDirectoryForPath(bowerPath);
-
-            // Temporary hack to deal with the fact that the filesystem caches directory entries and
-            // doesn't refresh unless you switch away from the Brackets window and back. This should
-            // go away when we have file watchers.
-            rootDir._clearCachedData();
-            bowerDir._clearCachedData();
-            
-            ProjectManager.refreshFileTree().done(function () {
-                ProjectManager.showInTree(FileSystem.getDirectoryForPath(bowerPath + pkgName));
-            });
         }).fail(function (error) {
             // Make sure the user sees the error even if other packages get installed.
             failed.push(pkgName);
+            FileSystem.off(".bower");
         }).always(function () {
             installPromise = null;
             if (queue.length === 0) {
@@ -143,15 +152,13 @@ define(function (require, exports, module) {
     
     function _fetchPackageList() {
         var result = new $.Deferred();
-        nodePromise.done(function () {
-            nodeConnection.domains.bower.getPackages().done(function (pkgs) {
-                pkgs.sort(function (pkg1, pkg2) {
-                    var name1 = pkg1.name.toLowerCase(), name2 = pkg2.name.toLowerCase();
-                    return (name1 < name2 ? -1 : (name1 === name2 ? 0 : 1));
-                });
-                packages = pkgs;
-                result.resolve();
-            }).fail(result.reject);
+        bowerDomain.exec("getPackages").done(function (pkgs) {
+            pkgs.sort(function (pkg1, pkg2) {
+                var name1 = pkg1.name.toLowerCase(), name2 = pkg2.name.toLowerCase();
+                return (name1 < name2 ? -1 : (name1 === name2 ? 0 : 1));
+            });
+            packages = pkgs;
+            result.resolve();
         }).fail(result.reject);
         return result;
     }
@@ -266,18 +273,6 @@ define(function (require, exports, module) {
         KeyBindingManager.addBinding(CMD_INSTALL_FROM_BOWER, {key: "Ctrl-Shift-B"});
         
         ExtensionUtils.loadStyleSheet(module, "styles.css");
-
-        AppInit.appReady(function () {
-            nodeConnection = new NodeConnection();
-            nodeConnection.connect(true).then(function () {
-                nodeConnection.loadDomains(
-                    [ExtensionUtils.getModulePath(module, "node/BowerDomain")],
-                    true
-                ).then(function () {
-                    nodePromise.resolve();
-                });
-            });
-        });
 
         QuickOpen.addQuickOpenPlugin({
             name: "installFromBower",
